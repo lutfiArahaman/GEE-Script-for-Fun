@@ -1,0 +1,242 @@
+/*******************************************************
+ * Continuous Burned Area Prep for BFAST (Taman Negara)
+ * - Landsat 8 C02 T1 L2 SR
+ * - 16-day NBR time series
+ * - Bi-temporal dNBR & RBR
+ * - Robust to empty windows & tropical clouds
+ *******************************************************/
+
+// -------------------------
+// 0) AOI & DATES (Taman Negara)
+// -------------------------
+var aoi_fc  = ee.FeatureCollection('FILE_DIRECTORY');
+// dissolve and clean topology (robust against self-intersections)
+var aoi = aoi_fc.union(1).geometry().buffer(0, 100);  // 100 m error margin
+
+var start = '2013-04-01';
+var end   = '2021-09-30';
+
+Map.centerObject(aoi, 8);
+Map.addLayer(aoi, {color: 'lime'}, 'AOI: Taman Negara', false);
+
+// -------------------------
+// 1) HELPERS (SCALING & MASKING)
+// -------------------------
+// Explicitly scale SR optical bands (C2 L2): reflectance = DN*0.0000275 - 0.2
+var OPTICAL = ['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7'];
+function scaleL8sr(img) {
+  var scaled = img.select(OPTICAL).multiply(0.0000275).subtract(0.2);
+  return img.addBands(scaled.rename(OPTICAL), null, true);
+}
+
+// QA_PIXEL mask: clouds, cloud shadows, cirrus, snow
+function maskL8sr(img) {
+  var qa = img.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(1 << 3).eq(0)   // cloud
+    .and(qa.bitwiseAnd(1 << 4).eq(0))      // cloud shadow
+    .and(qa.bitwiseAnd(1 << 2).eq(0))      // cirrus
+    .and(qa.bitwiseAnd(1 << 5).eq(0));     // snow
+  return img.updateMask(mask);
+}
+
+// Add NBR = (NIR - SWIR2) / (NIR + SWIR2)
+function addNBR(img) {
+  var nir = img.select('SR_B5');
+  var sw2 = img.select('SR_B7');
+  var nbr = nir.subtract(sw2).divide(nir.add(sw2)).rename('NBR');
+  return img.addBands(nbr);
+}
+
+// -------------------------
+// 2) LOAD & PREPROCESS L8
+// -------------------------
+var l8_raw = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterBounds(aoi)
+  .filterDate(start, end)
+  .filter(ee.Filter.lt('CLOUD_COVER', 80));  // keep something in cloudy tropics
+
+var l8 = l8_raw
+  .map(scaleL8sr)
+  .map(maskL8sr)
+  .map(addNBR)
+  .select(['NBR','SR_B5','SR_B7']);
+
+print('L8 raw count:', l8_raw.size());
+print('L8 after mask/scale/addNBR count:', l8.size());
+print('L8 first image (after filters):', l8.first());
+
+// -------------------------
+// 3) 16-DAY COMPOSITES (MEDIAN), SKIP EMPTY WINDOWS
+// -------------------------
+function dateList(startStr, endStr, stepDays) {
+  var s = ee.Date(startStr);
+  var e = ee.Date(endStr);
+  var n = e.difference(s, 'day').divide(stepDays).ceil();
+  return ee.List.sequence(0, n.subtract(1)).map(function(i) {
+    return s.advance(ee.Number(i).multiply(stepDays), 'day');
+  });
+}
+
+var windows = dateList(start, end, 16);
+
+// Build list with If() to skip empty windows
+var compList = windows.map(function(sd){
+  sd = ee.Date(sd);
+  var ed = sd.advance(16, 'day');
+  var winCol = l8.filterDate(sd, ed);
+  var has = winCol.size().gt(0);
+  return ee.Algorithms.If(has, 
+    winCol.median()
+      .set({
+        'system:time_start': sd.millis(),
+        'start_date': sd.format('YYYY-MM-dd'),
+        'end_date': ed.format('YYYY-MM-dd')
+      })
+      .clip(aoi),
+    null
+  );
+});
+
+// Remove nulls and create ImageCollection
+var composites = ee.ImageCollection(ee.List(compList).removeAll([null]));
+
+// Safety check
+print('16-day composites (non-empty windows):', composites.size());
+print('First composite:', composites.first());
+
+var visNBR = {min:-1, max:1, palette:['#440154','#21918c','#fde725']};
+Map.addLayer(composites.first().select('NBR'), visNBR, 'NBR (first 16-day composite)', false);
+
+// -------------------------
+// 4) BI-TEMPORAL dNBR & RBR BETWEEN CONSECUTIVE COMPOSITES
+//    dNBR_t = NBR_(t-1) - NBR_t
+//    RBR_t  = dNBR_t / (NBR_(t-1) + 1.001)
+// -------------------------
+var listComp = composites.toList(composites.size());
+var count = listComp.size();
+print('Composite count (for pairing):', count);
+
+var pairList = ee.List.sequence(1, count.subtract(1)).map(function(i){
+  i = ee.Number(i);
+  var prev = ee.Image(listComp.get(i.subtract(1)));
+  var curr = ee.Image(listComp.get(i));
+  var dNBR = prev.select('NBR').subtract(curr.select('NBR')).rename('dNBR');
+  var RBR  = dNBR.divide(prev.select('NBR').add(1.001)).rename('RBR');
+  return curr.addBands([dNBR, RBR])
+             .set({
+               'system:time_start': curr.get('system:time_start'),
+               'pair_start': curr.get('start_date'),
+               'pair_end':   curr.get('end_date')
+             })
+             .clip(aoi);
+});
+
+var pairwise = ee.ImageCollection(ee.List(pairList));
+print('Pairwise collection size:', pairwise.size());
+print('First pair image:', pairwise.first());
+
+var visDBR = {min:-1, max:1, palette:['#3b0f70','#8c2981','#de4968','#f66e5b','#fe9f6d','#fecf92']}; // for dNBR
+var visRBR = visDBR; // same palette/range as dNBR
+
+Map.addLayer(pairwise.first().select('dNBR'), visDBR, 'dNBR (first pair)', false);
+Map.addLayer(pairwise.first().select('RBR'),  visRBR, 'RBR (first pair)',  false);
+
+// -------------------------
+// 5) LEGEND (NBR / dNBR / RBR)
+// -------------------------
+/* Creates a UI panel with horizontal color bars matching the vis params above */
+function makeColorbar(palette, min, max, width, height) {
+  // build a left-to-right gradient image in [min,max] then visualize with palette
+  var lon = ee.Image.pixelLonLat().select('longitude');
+  var gradient = lon.subtract(-180).divide(360).multiply(max - min).add(min);
+  var colorbar = gradient.visualize({min:min, max:max, palette:palette});
+  return ui.Thumbnail({
+    image: colorbar,
+    params: {bbox:'0,0,1,0.1', dimensions: width + 'x' + height},
+    style: {stretch: 'horizontal', margin: '4px 0 8px 0'}
+  });
+}
+function legendEntry(title, palette, min, max) {
+  return ui.Panel([
+    ui.Label(title, {fontWeight:'bold', margin:'4px 0 2px 0'}),
+    makeColorbar(palette, min, max, 180, 16),
+    ui.Panel([
+      ui.Label(min.toString(), {fontSize:'10px', margin:'0', textAlign:'left', stretch:'horizontal'}),
+      ui.Label(max.toString(), {fontSize:'10px', margin:'0 0 0 8px', textAlign:'right'})
+    ], ui.Panel.Layout.flow('horizontal'), {margin:'-6px 0 8px 0'})
+  ], null, {margin:'0 0 8px 0'});
+}
+var legend = ui.Panel({
+  style:{
+    position:'bottom-left',
+    padding:'8px',
+    backgroundColor:'rgba(255,255,255,0.9)'
+  }
+});
+legend.add(ui.Label('Burn Indices Legend', {fontWeight:'bold', fontSize:'12px', margin:'0 0 6px 0'}));
+legend.add(legendEntry('NBR',  visNBR.palette, visNBR.min, visNBR.max));
+legend.add(legendEntry('dNBR', visDBR.palette, visDBR.min, visDBR.max));
+legend.add(legendEntry('RBR',  visRBR.palette, visRBR.min, visRBR.max));
+Map.add(legend);
+
+// -------------------------
+// 6) EXPORTS (run after you confirm sizes > 0)
+// -------------------------
+// Stacked images (multi-band by time)
+Export.image.toAsset({
+  image: composites.select('NBR').toBands(),
+  description: 'TN_L8_16day_NBR_stack',
+  assetId: 'users/you/TN_L8_16day_NBR_stack',
+  region: aoi,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+Export.image.toAsset({
+  image: pairwise.select(['dNBR','RBR']).toBands(),
+  description: 'TN_L8_16day_dNBR_RBR_stack',
+  assetId: 'users/you/TN_L8_16day_dNBR_RBR_stack',
+  region: aoi,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+// Mean-over-AOI CSVs for quick testing (optional)
+var nbrSeries = composites.map(function(img){
+  var mean = img.select('NBR').reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: 30,
+    maxPixels: 1e12
+  }).get('NBR');
+  return ee.Feature(null, {
+    date: ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
+    NBR_mean: mean
+  });
+});
+Export.table.toDrive({
+  collection: ee.FeatureCollection(nbrSeries),
+  description: 'TN_NBR_mean_time_series',
+  fileNamePrefix: 'TN_NBR_mean_time_series',
+  fileFormat: 'CSV'
+});
+
+var dnbrRbrSeries = pairwise.map(function(img){
+  var stats = img.select(['dNBR','RBR']).reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: 30,
+    maxPixels: 1e12
+  });
+  return ee.Feature(null, {
+    date: ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
+    dNBR_mean: stats.get('dNBR'),
+    RBR_mean:  stats.get('RBR')
+  });
+});
+Export.table.toDrive({
+  collection: ee.FeatureCollection(dnbrRbrSeries),
+  description: 'TN_dNBR_RBR_mean_time_series',
+  fileNamePrefix: 'TN_dNBR_RBR_mean_time_series',
+  fileFormat: 'CSV'
+});
