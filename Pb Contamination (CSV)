@@ -1,0 +1,164 @@
+/************************************************************
+ * HEAVY METAL (Pb) CONTAMINATION ANALYSIS USING IDW INTERPOLATION
+ * ---------------------------------------------------------------
+ * This script:
+ * 1️⃣ Imports CSV of Pb soil samples (lat, lon, Pb_ppm)
+ * 2️⃣ Converts to FeatureCollection
+ * 3️⃣ Performs IDW interpolation to map Pb concentration
+ * 4️⃣ Classifies high-risk zones (>100 ppm)
+ * 5️⃣ Visualizes concentration surface and risk map with legend
+ ************************************************************/
+
+// ======================================================
+// 1. DEFINE AREA OF INTEREST (AOI)
+// ======================================================
+var aoi = ee.FeatureCollection("YOUR_AOI");
+Map.centerObject(aoi, 9);
+Map.addLayer(aoi, {color: '00FF00', fillColor: '00FF0000'}, '1. Taman Negara Boundary');
+
+// ======================================================
+// 2. IMPORT CSV DATA (Replace with your actual asset ID)
+// ======================================================
+// CSV schema: lon, lat, Pb_ppm
+var table = ee.FeatureCollection('projects/your-project-id/assets/Pb_Soil_Samples_CSV');
+
+// Convert CSV rows into points with Pb_ppm property
+var samples = table.map(function(row) {
+  var lon = ee.Number(row.get('lon'));
+  var lat = ee.Number(row.get('lat'));
+  var val = ee.Number(row.get('Pb_ppm'));
+  var point = ee.Geometry.Point([lon, lat]);
+  return ee.Feature(point, {'Pb_ppm': val});
+})
+.filter(ee.Filter.notNull(['Pb_ppm']))
+.filter(ee.Filter.gte('Pb_ppm', 0))
+.filterBounds(aoi);
+
+print('Loaded samples:', samples);
+Map.addLayer(samples, {color:'black'}, '2. Observed Pb Sample Points');
+
+// ======================================================
+// 3. IDW INTERPOLATION (Inverse Distance Weighting)
+// ======================================================
+
+// User-adjustable parameters
+var IDW_POWER = 2;        // Weighting power (2 = typical)
+var IDW_RADIUS = 30000;   // Influence radius (meters)
+var OUT_SCALE = 250;      // Output resolution (meters)
+
+// Build projected coordinate grid for distance calculation
+var proj = ee.Projection('EPSG:3857').atScale(OUT_SCALE);
+var xy = ee.Image.pixelCoordinates(proj).rename(['x', 'y']);
+
+// Prepare list of sample features
+var n = samples.size();
+var fList = ee.List(samples.toList(n));
+
+// For each point: compute distance, weight, weighted value
+var perPointImgs = ee.ImageCollection(
+  ee.List.sequence(0, n.subtract(1)).map(function(i) {
+    var f = ee.Feature(fList.get(i));
+    var g = f.geometry().transform(proj, 1);
+    var coords = ee.List(g.coordinates());
+    var x0 = ee.Number(coords.get(0));
+    var y0 = ee.Number(coords.get(1));
+    var v  = ee.Number(f.get('Pb_ppm'));
+
+    var dx = xy.select('x').subtract(x0);
+    var dy = xy.select('y').subtract(y0);
+    var dist = dx.hypot(dy);
+
+    var w = dist.max(1).pow(-IDW_POWER) // avoid division by zero
+             .updateMask(dist.lte(IDW_RADIUS)).rename('w');
+    var num = w.multiply(v).rename('num');
+
+    return w.addBands(num);
+  })
+);
+
+// Sum of weights and weighted values
+var sums = perPointImgs.sum();
+var wSum = sums.select('w');
+var numSum = sums.select('num');
+
+// Final IDW surface
+var idwSurface = numSum.divide(wSum)
+  .rename('Pb_ppm_IDW')
+  .reproject(proj)
+  .clip(aoi);
+
+var MIN_CONC = 5;
+var MAX_CONC = 150;
+
+var visParams_Surface = {
+  min: MIN_CONC,
+  max: MAX_CONC,
+  palette: ['#008000', '#A5D6A7', '#FFF59D', '#FFB74D', '#E53935'], // green→red
+  opacity: 0.8
+};
+
+Map.addLayer(idwSurface, visParams_Surface, '3. Interpolated Pb Concentration (IDW)');
+
+// ======================================================
+// 4. RISK CLASSIFICATION MAP
+// ======================================================
+var HIGH_RISK_THRESHOLD = 100; // ppm threshold
+var riskSurface = idwSurface.gt(HIGH_RISK_THRESHOLD).rename('High_Risk_Area');
+
+Map.addLayer(
+  riskSurface.updateMask(riskSurface),
+  {palette:['FF0000'], opacity:0.7},
+  '4. High Risk Areas (> '+HIGH_RISK_THRESHOLD+' ppm)'
+);
+
+// ======================================================
+// 5. LEGEND PANEL (UI)
+// ======================================================
+var legend = ui.Panel({
+  style: {position: 'bottom-left', padding: '8px 15px'}
+});
+legend.add(ui.Label({
+  value: 'Pb Concentration & Risk Surface',
+  style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 4px 0'}
+}));
+
+var makeColorBarParams = function(palette) {
+  return {
+    bbox: [0, 0, 1, 0.1],
+    dimensions: '100x10',
+    format: 'png',
+    min: 0,
+    max: 1,
+    palette: palette
+  };
+};
+
+legend.add(ui.Label('Concentration (Pb_ppm):'));
+legend.add(ui.Thumbnail({
+  image: ee.Image.pixelLonLat().select(0),
+  params: makeColorBarParams(visParams_Surface.palette),
+  style: {stretch: 'horizontal', margin: '0 8px', maxHeight: '24px'}
+}));
+
+legend.add(ui.Panel({
+  widgets: [
+    ui.Label(MIN_CONC + ' ppm (Low)', {margin: '4px 8px'}),
+    ui.Label(MAX_CONC + ' ppm (High)', {margin: '4px 8px', textAlign: 'right', stretch: 'horizontal'})
+  ],
+  layout: ui.Panel.Layout.flow('horizontal')
+}));
+
+legend.add(ui.Label('Risk Status:'));
+legend.add(ui.Panel({
+  widgets: [
+    ui.Label('High Risk (> ' + HIGH_RISK_THRESHOLD + ' ppm)', {margin: '4px 8px'}),
+    ui.Label(' ', {backgroundColor: '#FF0000', padding: '8px', margin: '0 0 0 8px'})
+  ],
+  layout: ui.Panel.Layout.flow('horizontal')
+}));
+
+Map.add(legend);
+
+// ======================================================
+// END OF SCRIPT
+// ======================================================
