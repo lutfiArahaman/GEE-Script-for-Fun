@@ -2,7 +2,7 @@
 // VERSION 7 - Exporting all months as a single multi-band image (stack)
 
 // 1. Define Area of Interest (AOI)
-var roi = ee.FeatureCollection('projects/spatial-country-433907-t2/assets/Selangor');
+var roi = [insert asset path];
 Map.centerObject(roi, 9);
 Map.addLayer(roi, {color: 'white', fillColor: '00000000'}, 'Selangor AOI');
 
