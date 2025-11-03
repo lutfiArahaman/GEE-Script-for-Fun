@@ -1,0 +1,139 @@
+// GEE Script: Air Pollution Analysis for Selangor
+// VERSION 7 - Exporting all months as a single multi-band image (stack)
+
+// 1. Define Area of Interest (AOI)
+var roi = ee.FeatureCollection('projects/spatial-country-433907-t2/assets/Selangor');
+Map.centerObject(roi, 9);
+Map.addLayer(roi, {color: 'white', fillColor: '00000000'}, 'Selangor AOI');
+
+// 2. Define Time Period
+var startDate = '2019-01-01';
+var endDate = '2024-12-31';
+
+// 3. Load NO2 Data
+var no2Collection = ee.ImageCollection('COPERNICUS/S5P/OFFL/L3_NO2')
+  .filterBounds(roi)
+  .filterDate(startDate, endDate)
+  .select('tropospheric_NO2_column_number_density');
+
+// 4. Load CO Data
+var coCollection = ee.ImageCollection('COPERNICUS/S5P/OFFL/L3_CO')
+  .filterBounds(roi)
+  .filterDate(startDate, endDate)
+  .select('CO_column_number_density');
+
+// 5. Create Monthly Averages
+// This function creates the monthly composites.
+var createMonthlyMean = function(collection, bandName) {
+  var months = ee.List.sequence(0, ee.Date(endDate).difference(ee.Date(startDate), 'month').round().subtract(1));
+  var start = ee.Date(startDate);
+  
+  var monthlyImages = ee.ImageCollection.fromImages(
+    months.map(function(m) {
+      var s = start.advance(m, 'month');
+      var e = s.advance(1, 'month');
+      
+      var mean = collection.filterDate(s, e)
+                           .mean()
+                           .set('system:time_start', s.millis())
+                           .set('band', bandName);
+      return mean.clip(roi);
+    })
+  );
+  return monthlyImages;
+};
+
+var monthlyNO2 = createMonthlyMean(no2Collection, 'NO2');
+var monthlyCO = createMonthlyMean(coCollection, 'CO');
+
+// 6. Visualize Mean Concentrations on the Map (Mean of the entire period)
+var no2Mean = no2Collection.mean().clip(roi);
+var coMean = coCollection.mean().clip(roi);
+
+var no2Vis = {
+  min: 0,
+  max: 0.0001,
+  palette: ['black', 'blue', 'purple', 'cyan', 'green', 'yellow', 'red']
+};
+var coVis = {
+  min: 0.02,
+  max: 0.04,
+  palette: ['black', 'blue', 'purple', 'cyan', 'green', 'yellow', 'red']
+};
+
+Map.addLayer(no2Mean, no2Vis, 'Mean NO2 (2019-2024)');
+Map.addLayer(coMean, coVis, 'Mean CO (2019-2024)');
+
+// 7. Generate Time Series Charts (This still works)
+var chartNO2 = ui.Chart.image.series({
+  imageCollection: monthlyNO2,
+  region: roi,
+  reducer: ee.Reducer.mean(),
+  scale: 1000,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'Monthly Mean NO2 Concentration over Selangor (2019-2024)',
+  vAxis: {title: 'NO2 (mol/m²)'},
+  hAxis: {title: 'Date'},
+  lineWidth: 1,
+  pointSize: 3,
+  colors: ['#d95f02']
+});
+
+var chartCO = ui.Chart.image.series({
+  imageCollection: monthlyCO,
+  region: roi,
+  reducer: ee.Reducer.mean(),
+  scale: 1000,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'Monthly Mean CO Concentration over Selangor (2019-2024)',
+  vAxis: {title: 'CO (mol/m²)'},
+  hAxis: {title: 'Date'},
+  lineWidth: 1,
+  pointSize: 3,
+  colors: ['#1b9e77']
+});
+
+print(chartNO2);
+print(chartCO);
+
+// --- 8. EXPORT MONTHLY IMAGES AS A STACK ---
+// This new section creates a multi-band image where each band is one month.
+
+// First, we map over the monthly collection to give each band a clean name (e.g., "2019_01")
+var monthlyNO2_renamed = monthlyNO2.map(function(image) {
+  var dateString = image.date().format('YYYY_MM');
+  return image.rename(dateString);
+});
+
+var monthlyCO_renamed = monthlyCO.map(function(image) {
+  var dateString = image.date().format('YYYY_MM');
+  return image.rename(dateString);
+});
+
+// Now, convert the ImageCollection to a single, multi-band image (a "stack")
+var no2Stack = monthlyNO2_renamed.toBands();
+var coStack = monthlyCO_renamed.toBands();
+
+// Export the NO2 stack
+Export.image.toDrive({
+  image: no2Stack,
+  description: 'Selangor_Monthly_NO2_Stack_2019-2024',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'Selangor_Monthly_NO2_Stack_2019-2024',
+  scale: 1000,
+  region: roi.geometry(),
+  maxPixels: 1e10
+});
+
+// Export the CO stack
+Export.image.toDrive({
+  image: coStack,
+  description: 'Selangor_Monthly_CO_Stack_2019-2024',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'Selangor_Monthly_CO_Stack_2019-2024',
+  scale: 1000,
+  region: roi.geometry(),
+  maxPixels: 1e10
+});
